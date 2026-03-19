@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.aerodynamics import (
     BoattailGeometry,
     LauncherGeometry,
+    _wave_drag_transition_bounds,
     angle_of_attack_increment,
     compute_drag,
     _atmosphere,
@@ -46,6 +47,20 @@ def test_atmosphere_sea_level():
 def test_atmosphere_stratosphere():
     a, nu = _atmosphere(15_000)
     assert 295 < a < 320   # speed of sound drops in the stratosphere
+
+
+@pytest.mark.parametrize(
+    ("altitude_m", "expected_a", "expected_nu"),
+    [
+        (0.0, 340.3, 1.46e-5),
+        (11_000.0, 295.2, 3.9e-5),
+        (20_000.0, 295.1, 1.61e-4),
+    ],
+)
+def test_atmosphere_matches_isa_reference_points(altitude_m, expected_a, expected_nu):
+    a, nu = _atmosphere(altitude_m)
+    assert a == pytest.approx(expected_a, rel=0.02)
+    assert nu == pytest.approx(expected_nu, rel=0.08)
 
 
 # ---- derived geometry ------------------------------------------------------
@@ -116,6 +131,44 @@ def test_wave_drag_supersonic_nonzero():
     g = simple_geom()
     result = compute_drag(g, mach)
     assert np.all(result.CD_wave_supersonic > 0)
+
+
+def test_base_drag_is_independent_of_mach_grid_anchor_sampling():
+    g = simple_geom()
+    mach_dense = np.array([0.6, 0.9, 1.2, 2.0, 3.0])
+    mach_sparse = np.array([0.9, 1.2, 2.0, 3.0])
+
+    result_dense = compute_drag(g, mach_dense)
+    result_sparse = compute_drag(g, mach_sparse)
+
+    np.testing.assert_allclose(
+        result_dense.Cd_base[1:],
+        result_sparse.Cd_base,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+
+def test_wave_drag_transition_is_continuous():
+    g = simple_geom()
+    mach_div, mach_final = _wave_drag_transition_bounds(g)
+    eps = 1e-4
+    mach = np.array([
+        mach_div - eps,
+        mach_div,
+        mach_div + eps,
+        mach_final - eps,
+        mach_final,
+        mach_final + eps,
+    ])
+
+    result = compute_drag(g, mach)
+    wave_total = result.CD_wave_transonic + result.CD_wave_supersonic
+
+    assert abs(wave_total[1] - wave_total[0]) < 1e-3
+    assert abs(wave_total[2] - wave_total[1]) < 1e-3
+    assert abs(wave_total[4] - wave_total[3]) < 1e-3
+    assert abs(wave_total[5] - wave_total[4]) < 1e-3
 
 
 # ---- angle-of-attack increment ---------------------------------------------

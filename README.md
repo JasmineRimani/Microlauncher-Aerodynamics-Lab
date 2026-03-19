@@ -16,12 +16,13 @@ Project context and the broader micro-launcher methodology are described in:
 
 | Component | Model source |
 |-----------|-------------|
+| Atmosphere | ISA 1976 temperature/pressure with Sutherland viscosity |
 | Skin-friction drag (body, fins, protuberances) | Compressible turbulent flat-plate + roughness limit (Stoney / Fleeman) |
-| Base drag | Piecewise-polynomial fit anchored at M = 0.6 |
-| Transonic wave drag | Drag-divergence / drag-rise fit (Walpot) |
+| Base drag | Piecewise-polynomial fit with an analytical M = 0.6 anchor |
+| Transonic wave drag | Drag-divergence / drag-rise fit (Walpot), blended continuously into the supersonic nose model |
 | Supersonic wave drag | Ogive pressure coefficient (Fleeman) |
 | Boattail drag | Frustum base-pressure model |
-| AoA increment | Cross-flow + leading-edge suction (Fleeman) |
+| AoA increment | Cross-flow + leading-edge suction (Fleeman, small-angle use) |
 
 ---
 
@@ -122,4 +123,3 @@ The example launcher ("Alpha-1") uses **completely fictitious** geometry to
 demonstrate the tool.  No real vehicle data is included or implied.
 
 ---
-

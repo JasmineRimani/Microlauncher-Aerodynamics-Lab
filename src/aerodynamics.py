@@ -28,6 +28,18 @@ from typing import Optional, Sequence
 M_TO_IN = 39.3701
 FT_TO_M = 0.3048
 DEG_TO_RAD = np.pi / 180.0
+ISA_GAMMA = 1.4
+ISA_GAS_CONSTANT = 287.05287
+ISA_G0 = 9.80665
+ISA_EARTH_RADIUS_M = 6_356_766.0
+ISA_SUTHERLAND_T0 = 288.15
+ISA_SUTHERLAND_MU0 = 1.7894e-5
+ISA_SUTHERLAND_C = 110.4
+BASE_DRAG_ANCHOR_MACH = 0.6
+WAVE_DRAG_BLEND_WIDTH = 0.1
+ISA_LAYER_BASE_ALTITUDES_M = np.array([0.0, 11_000.0, 20_000.0, 32_000.0, 47_000.0, 51_000.0, 71_000.0])
+ISA_LAYER_TOP_ALTITUDE_M = 84_852.0
+ISA_LAYER_LAPSE_RATES = np.array([-0.0065, 0.0, 0.0010, 0.0028, 0.0, -0.0028, -0.0020])
 
 
 def _as_positive_vector(values: Sequence[float], name: str) -> np.ndarray:
@@ -50,6 +62,25 @@ def _validate_optional_component(flag: bool, component: object | None, name: str
     """Ensure optional geometry blocks are supplied when their flag is enabled."""
     if flag and component is None:
         raise ValueError(f"{name} geometry must be provided when {name.lower()}_exists is True.")
+
+
+def _smoothstep(x: float) -> float:
+    """Cubic smoothstep clipped to the unit interval."""
+    x = float(np.clip(x, 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _walpot_transition_blend(x: float) -> float:
+    """Normalized Walpot transonic blend factor on x in [0, 1]."""
+    raw_blend = (
+        -8.3474 * x ** 5
+        + 24.543 * x ** 4
+        - 24.946 * x ** 3
+        + 8.6321 * x ** 2
+        + 1.1195 * x
+    )
+    blend_at_one = -8.3474 + 24.543 - 24.946 + 8.6321 + 1.1195
+    return float(np.clip(raw_blend / blend_at_one, 0.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -254,39 +285,69 @@ class ProtuberanceGeometry:
 def _atmosphere(altitude_m: float):
     """
     Return speed of sound [m/s] and kinematic viscosity [m²/s] at
-    the given geometric altitude using the piecewise-linear fits from
-    the original Fleeman / Stoney correlations (imperial internally).
+    the given geometric altitude using the 1976 International Standard
+    Atmosphere with Sutherland's law for viscosity.
 
     Parameters
     ----------
     altitude_m : float
-        Geometric altitude [m].
+        Geometric altitude [m]. Altitudes above the ISA model ceiling are
+        clamped to the top layer because aerodynamic drag is negligible there.
 
     Returns
     -------
     a_m : float  Speed of sound [m/s].
     nu_m : float Kinematic viscosity [m²/s].
     """
-    alt_ft = altitude_m / FT_TO_M
+    geometric_altitude_m = max(float(altitude_m), 0.0)
+    geopotential_altitude_m = (
+        ISA_EARTH_RADIUS_M * geometric_altitude_m / (ISA_EARTH_RADIUS_M + geometric_altitude_m)
+    )
+    geopotential_altitude_m = min(geopotential_altitude_m, ISA_LAYER_TOP_ALTITUDE_M)
 
-    # Speed of sound [ft/s]
-    if alt_ft < 37_000:
-        a_ft = -0.004 * alt_ft + 1_116.45
-    elif alt_ft > 64_000:
-        a_ft = 0.0007 * alt_ft + 924.99
-    else:
-        a_ft = 968.08
+    temperature_k = ISA_SUTHERLAND_T0
+    pressure_pa = 101_325.0
 
-    # Kinematic viscosity [ft²/s]
-    if alt_ft < 15_000:
-        a_coef, b_coef = 0.00002503, 0.0
-    elif alt_ft > 30_000:
-        a_coef, b_coef = 0.00004664, -0.6882
-    else:
-        a_coef, b_coef = 0.00002760, -0.03417
-    nu_ft = 0.000157 * np.exp(a_coef * alt_ft + b_coef)
+    for layer_index, layer_base_altitude_m in enumerate(ISA_LAYER_BASE_ALTITUDES_M):
+        lapse_rate = ISA_LAYER_LAPSE_RATES[layer_index]
+        layer_top_altitude_m = (
+            ISA_LAYER_BASE_ALTITUDES_M[layer_index + 1]
+            if layer_index + 1 < len(ISA_LAYER_BASE_ALTITUDES_M)
+            else ISA_LAYER_TOP_ALTITUDE_M
+        )
 
-    return a_ft * FT_TO_M, nu_ft * FT_TO_M ** 2
+        if geopotential_altitude_m <= layer_top_altitude_m:
+            delta_h = geopotential_altitude_m - layer_base_altitude_m
+            if np.isclose(lapse_rate, 0.0):
+                pressure_pa *= np.exp(-ISA_G0 * delta_h / (ISA_GAS_CONSTANT * temperature_k))
+            else:
+                next_temperature_k = temperature_k + lapse_rate * delta_h
+                pressure_pa *= (next_temperature_k / temperature_k) ** (
+                    -ISA_G0 / (lapse_rate * ISA_GAS_CONSTANT)
+                )
+                temperature_k = next_temperature_k
+            break
+
+        delta_h = layer_top_altitude_m - layer_base_altitude_m
+        if np.isclose(lapse_rate, 0.0):
+            pressure_pa *= np.exp(-ISA_G0 * delta_h / (ISA_GAS_CONSTANT * temperature_k))
+        else:
+            next_temperature_k = temperature_k + lapse_rate * delta_h
+            pressure_pa *= (next_temperature_k / temperature_k) ** (
+                -ISA_G0 / (lapse_rate * ISA_GAS_CONSTANT)
+            )
+            temperature_k = next_temperature_k
+
+    density_kg_m3 = pressure_pa / (ISA_GAS_CONSTANT * temperature_k)
+    viscosity_pa_s = ISA_SUTHERLAND_MU0 * (
+        (temperature_k / ISA_SUTHERLAND_T0) ** 1.5
+        * (ISA_SUTHERLAND_T0 + ISA_SUTHERLAND_C)
+        / (temperature_k + ISA_SUTHERLAND_C)
+    )
+    speed_of_sound_m_s = np.sqrt(ISA_GAMMA * ISA_GAS_CONSTANT * temperature_k)
+    kinematic_viscosity_m2_s = viscosity_pa_s / density_kg_m3
+
+    return speed_of_sound_m_s, kinematic_viscosity_m2_s
 
 
 def _compressibility_reynolds_factor(mach: float) -> float:
@@ -329,6 +390,98 @@ def _roughness_limited_skin_friction(
 
     cf_rough_inc = 1.0 / (1.89 + 1.62 * np.log10(reference_length_in / roughness_m)) ** 2.5
     return cf_rough_inc / (1 + 0.2044 * mach ** 2)
+
+
+def _base_drag_subsonic(geom: LauncherGeometry, cd_friction_body: float) -> float:
+    """Return the subsonic base-drag relation used to anchor the model."""
+    length_ratio = geom.L_to_d_max / geom.d_max
+    k_b = 0.0274 * np.arctan(length_ratio + 0.0116)
+    exponent_n = 3.6542 * length_ratio ** (-0.2733)
+    return k_b * (geom.d_base / geom.d_max) ** exponent_n / np.sqrt(max(cd_friction_body, 1e-12))
+
+
+def _base_drag_scale_factor(mach: float) -> float:
+    """Return Fleeman's piecewise base-drag scale factor relative to M = 0.6."""
+    if mach < 1.0:
+        return 1 + 215.8 * (mach - BASE_DRAG_ANCHOR_MACH) ** 6
+    if mach <= 2.0:
+        return (
+            2.0881 * (mach - 1) ** 3
+            - 3.7938 * (mach - 1) ** 2
+            + 1.4618 * (mach - 1)
+            + 1.8882917
+        )
+    if mach <= 2.5:
+        return (
+            0.297 * (mach - 2) ** 3
+            - 0.7937 * (mach - 2) ** 2
+            - 0.1115 * (mach - 2)
+            + 1.64006
+        )
+    raise ValueError("Base-drag scale factor is only defined up to Mach 2.5.")
+
+
+def _base_drag_anchor_value(
+    geom: LauncherGeometry,
+    altitude_m: float,
+) -> float:
+    """Compute the model anchor at M = 0.6 independently of the user Mach grid."""
+    anchor_friction_body = skin_friction_drag(
+        np.array([BASE_DRAG_ANCHOR_MACH]),
+        geom,
+        altitude_m,
+    )[0][0]
+    return _base_drag_subsonic(geom, anchor_friction_body)
+
+
+def _high_mach_base_drag_polynomial(cd_base_06: float) -> np.poly1d:
+    """Fit the high-Mach base-drag continuation from fixed anchor points."""
+    mach_anchor = np.array([2.0, 2.25, 2.5, 5.0, 7.0, 9.0, 10.0])
+    cd_anchor = np.array(
+        [
+            cd_base_06 * _base_drag_scale_factor(2.0),
+            cd_base_06 * _base_drag_scale_factor(2.25),
+            cd_base_06 * _base_drag_scale_factor(2.5),
+            0.05,
+            0.03,
+            0.02,
+            0.01,
+        ]
+    )
+    return np.poly1d(np.polyfit(mach_anchor, cd_anchor, 4))
+
+
+def _wave_drag_transition_bounds(geom: LauncherGeometry) -> tuple[float, float]:
+    """Return drag-divergence and supersonic-transition Mach numbers."""
+    r_d = geom.L_nose / geom.d_max
+    mach_div = -0.0156 * r_d ** 2 + 0.136 * r_d + 0.6817
+
+    rln = geom.L_nose / geom.L_effective
+    if rln < 0.2:
+        a_coef, b_coef = 2.4, -1.05
+    else:
+        a_coef = -321.94 * rln ** 2 + 264.07 * rln - 36.348
+        b_coef = 19.634 * rln ** 2 - 18.369 * rln + 1.7434
+    mach_final = a_coef * (geom.L_effective / geom.d_max) ** b_coef + 1.0275
+
+    return mach_div, mach_final
+
+
+def _supersonic_nose_wave_drag(
+    geom: LauncherGeometry,
+    mach: float,
+    shape_factor: float,
+    area_ratio: float,
+) -> float:
+    """Return Fleeman's supersonic ogive nose-wave drag coefficient."""
+    if mach < 1.0:
+        return 0.0
+
+    cd_bp_nose = (
+        2.1 * np.sin(geom.phi) ** 2
+        + 0.5 * np.sin(geom.phi) / np.sqrt(max(mach ** 2 - 1, 1e-6))
+    )
+    return shape_factor * cd_bp_nose * geom.F_cr * area_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -470,45 +623,17 @@ def base_drag(
     Cd_base : ndarray
     """
     mach = np.asarray(mach_array, dtype=float)
-    g = geom
-
     Cd_base = np.zeros_like(mach)
-    Cd_base_06 = None  # anchored at M=0.6
+    cd_base_06 = _base_drag_anchor_value(geom, altitude_m)
+    high_mach_poly = _high_mach_base_drag_polynomial(cd_base_06)
 
     for j, M in enumerate(mach):
-        if M <= 0.6:
-            K_b = 0.0274 * np.arctan(g.L_to_d_max / g.d_max + 0.0116)
-            n   = 3.6542 * (g.L_to_d_max / g.d_max) ** (-0.2733)
-            Cd_base[j] = (K_b * (g.d_base / g.d_max) ** n
-                          / np.sqrt(max(Cd_friction_body[j], 1e-12)))
-            if abs(M - 0.6) < 1e-9:
-                Cd_base_06 = Cd_base[j]
+        if M <= BASE_DRAG_ANCHOR_MACH:
+            Cd_base[j] = _base_drag_subsonic(geom, Cd_friction_body[j])
+        elif M <= 2.5:
+            Cd_base[j] = cd_base_06 * _base_drag_scale_factor(M)
         else:
-            # Make sure anchor is available (interpolate if M array skips 0.6)
-            if Cd_base_06 is None:
-                Cd_base_06 = Cd_base[j - 1]
-
-            if M < 1.0:
-                f_b = 1 + 215.8 * (M - 0.6) ** 6
-                Cd_base[j] = Cd_base_06 * f_b
-            elif M <= 2.0:
-                f_b = (2.0881 * (M - 1) ** 3 - 3.7938 * (M - 1) ** 2
-                       + 1.4618 * (M - 1) + 1.8882917)
-                Cd_base[j] = Cd_base_06 * f_b
-            elif M <= 2.5:
-                f_b = (0.297 * (M - 2) ** 3 - 0.7937 * (M - 2) ** 2
-                       - 0.1115 * (M - 2) + 1.64006)
-                Cd_base[j] = Cd_base_06 * f_b
-            else:
-                # Polynomial fit through anchor points at high Mach
-                mask  = (mach >= 2.0) & (mach <= 2.5)
-                Mach_anchor = np.append(mach[mask], [5.0, 7.0, 9.0, 10.0])
-                CD_anchor   = np.append(Cd_base[mask], [0.05, 0.03, 0.02, 0.01])
-                if len(Mach_anchor) >= 5:
-                    p_poly = np.polyfit(Mach_anchor, CD_anchor, 4)
-                    Cd_base[j] = np.polyval(p_poly, M)
-                else:
-                    Cd_base[j] = 0.01  # fallback for very sparse Mach arrays
+            Cd_base[j] = max(float(high_mach_poly(M)), 0.0)
 
     return Cd_base
 
@@ -529,55 +654,49 @@ def wave_drag(
     CD_wave_supersonic : ndarray  Supersonic wave drag CD.
     """
     mach = np.asarray(mach_array, dtype=float)
-    g    = geom
-
-    r_d = g.L_nose / g.d_max
-    mach_div = -0.0156 * r_d ** 2 + 0.136 * r_d + 0.6817
-
-    # Parameters for the final (supersonic) Mach transition
-    rln = g.L_nose / g.L_effective
-    if rln < 0.2:
-        a_coef, b_coef = 2.4, -1.05
-    else:
-        a_coef = -321.94 * rln ** 2 + 264.07 * rln - 36.348
-        b_coef =   19.634 * rln ** 2 - 18.369 * rln +  1.7434
-    mach_final = a_coef * (g.L_effective / g.d_max) ** b_coef + 1.0275
+    g = geom
+    mach_div, mach_final = _wave_drag_transition_bounds(g)
 
     # Nose pressure drag at transonic onset
-    A_ratio = (g.d_nose / g.d_max) ** 2  # area ratio nose / max cross-section
+    A_ratio = (g.d_nose / g.d_max) ** 2
     Cd_bp_0 = 0.8 * np.sin(g.phi) ** 2
     shape_factor = 0.72 * (g.ogive_factor - 0.5) ** 2 + 0.82
     Cd_pb_0_blunt = shape_factor * Cd_bp_0 * g.F_cr * A_ratio
 
-    # Peak wave drag
-    c_peak =  50.676 * rln ** 2 - 51.734 * rln + 15.642
-    g_peak =  -2.2538 * rln ** 2 + 1.3108 * rln - 1.7344
-    Cd_bp_nose_sup = (2.1 * np.sin(g.phi) ** 2
-                      + 0.5 * np.sin(g.phi) / np.sqrt(max(mach_final ** 2 - 1, 1e-6)))
-    delta_CD_max = shape_factor * Cd_bp_nose_sup * g.F_cr * A_ratio
+    cd_wave_transition_end = _supersonic_nose_wave_drag(
+        g,
+        mach_final,
+        shape_factor,
+        A_ratio,
+    )
 
     CD_trans = np.zeros_like(mach)
     CD_super = np.zeros_like(mach)
+    blend_start = mach_final - WAVE_DRAG_BLEND_WIDTH
+    blend_span = max(2 * WAVE_DRAG_BLEND_WIDTH, 1e-6)
 
     for j, M in enumerate(mach):
-        # --- Transonic ---
         if M < mach_div:
-            CD_trans[j] = Cd_pb_0_blunt
-        elif M > mach_final:
-            CD_trans[j] = 0.0
+            cd_transonic_model = Cd_pb_0_blunt
         else:
-            x = (M - mach_div) / (mach_final - mach_div)
-            F = (-8.3474 * x ** 5 + 24.543 * x ** 4
-                 - 24.946 * x ** 3 + 8.6321 * x ** 2 + 1.1195 * x)
-            CD_trans[j] = delta_CD_max * F
+            x = (M - mach_div) / max(mach_final - mach_div, 1e-6)
+            normalized_blend = _walpot_transition_blend(x)
+            cd_transonic_model = Cd_pb_0_blunt + (
+                cd_wave_transition_end - Cd_pb_0_blunt
+            ) * normalized_blend
 
-        # --- Supersonic ---
-        if M >= mach_final:
-            Cd_bp_nose = (2.1 * np.sin(g.phi) ** 2
-                          + 0.5 * np.sin(g.phi) / np.sqrt(M ** 2 - 1))
-            CD_super[j] = shape_factor * Cd_bp_nose * g.F_cr * A_ratio
-        else:
+        cd_supersonic_model = _supersonic_nose_wave_drag(g, M, shape_factor, A_ratio)
+
+        if M <= blend_start:
+            CD_trans[j] = cd_transonic_model
             CD_super[j] = 0.0
+        elif M >= mach_final + WAVE_DRAG_BLEND_WIDTH:
+            CD_trans[j] = 0.0
+            CD_super[j] = cd_supersonic_model
+        else:
+            blend = _smoothstep((M - blend_start) / blend_span)
+            CD_trans[j] = (1.0 - blend) * cd_transonic_model
+            CD_super[j] = blend * cd_supersonic_model
 
     return CD_trans, CD_super
 
@@ -689,6 +808,10 @@ def angle_of_attack_increment(
     """
     Estimate the incremental drag coefficient due to non-zero angle of attack
     (small-angle approximation).
+
+    This correlation is intended for modest angles of attack, roughly up to
+    15 degrees. It does not include high-angle nonlinear effects, normal-force
+    build-up, or moment corrections.
 
     Parameters
     ----------
