@@ -92,6 +92,15 @@ pip install pytest
 pytest tests/ -v
 ```
 
+To also export a reference drag table and plot during the test run:
+
+```bash
+pytest tests/ -v --report-dir test_reports
+```
+
+This writes `drag_reference_table.csv` and `drag_reference_plot.png` into the
+chosen report directory.
+
 ---
 
 ## Input geometry description

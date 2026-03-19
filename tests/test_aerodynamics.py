@@ -3,6 +3,7 @@ Basic unit tests for the aerodynamics module.
 Run with:  pytest tests/test_aerodynamics.py -v
 """
 
+import csv
 import sys
 from pathlib import Path
 
@@ -33,6 +34,75 @@ def simple_geom(**kwargs):
     )
     defaults.update(kwargs)
     return LauncherGeometry(**defaults)
+
+
+def write_drag_report(report_dir: Path, result) -> None:
+    """Write a table and plot for the reference drag sweep."""
+    table_path = report_dir / "drag_reference_table.csv"
+    plot_path = report_dir / "drag_reference_plot.png"
+
+    with table_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                "Mach",
+                "Cd_friction_body",
+                "Cd_friction_total",
+                "Cd_base",
+                "Cd_wave_transonic",
+                "Cd_wave_supersonic",
+                "Cd_boattail",
+                "Cd_total_zero_lift",
+            ]
+        )
+        for row in zip(
+            result.mach,
+            result.Cd_friction_body,
+            result.Cd_friction_total,
+            result.Cd_base,
+            result.CD_wave_transonic,
+            result.CD_wave_supersonic,
+            result.Cd_boattail,
+            result.CD_total_zero_lift,
+        ):
+            writer.writerow([f"{value:.8f}" for value in row])
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    axes[0].stackplot(
+        result.mach,
+        result.Cd_friction_total,
+        result.Cd_base,
+        result.CD_wave_transonic + result.CD_wave_supersonic,
+        result.Cd_boattail,
+        labels=["Skin Friction", "Base Drag", "Wave Drag", "Boattail"],
+        alpha=0.75,
+    )
+    axes[0].plot(result.mach, result.CD_total_zero_lift, "k-", lw=1.8, label="Total")
+    axes[0].set_xlabel("Mach")
+    axes[0].set_ylabel("Drag Coefficient")
+    axes[0].set_title("Drag Component Breakdown")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+    axes[0].legend(fontsize=8, loc="upper right")
+
+    axes[1].plot(result.mach, result.CD_total_zero_lift, lw=2.0, label="Total")
+    axes[1].plot(result.mach, result.Cd_base, lw=1.5, linestyle="--", label="Base")
+    axes[1].plot(result.mach, result.CD_wave_transonic + result.CD_wave_supersonic, lw=1.5, linestyle="-.", label="Wave")
+    axes[1].plot(result.mach, result.Cd_friction_total, lw=1.5, linestyle=":", label="Friction")
+    axes[1].set_xlabel("Mach")
+    axes[1].set_ylabel("Drag Coefficient")
+    axes[1].set_title("Reference Drag Curves")
+    axes[1].grid(True, linestyle="--", alpha=0.5)
+    axes[1].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---- atmosphere ------------------------------------------------------------
@@ -87,13 +157,16 @@ def test_geometry_requires_boattail_definition_when_enabled():
 
 # ---- component drag sanity -------------------------------------------------
 
-def test_zero_lift_drag_positive():
+def test_zero_lift_drag_positive(report_dir):
     mach = np.arange(0.1, 6.1, 0.1)
     g = simple_geom()
     result = compute_drag(g, mach)
     assert np.all(result.CD_total_zero_lift >= 0), "CD must be non-negative"
     assert np.all(result.Cd_friction_total  >= 0)
     assert np.all(result.Cd_base           >= 0)
+
+    if report_dir is not None:
+        write_drag_report(report_dir, result)
 
 
 def test_zero_lift_drag_shape():
