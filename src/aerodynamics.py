@@ -22,8 +22,34 @@ Author: translated/adapted for open publication (original MATLAB by J. Rimani,
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+M_TO_IN = 39.3701
+FT_TO_M = 0.3048
+DEG_TO_RAD = np.pi / 180.0
+
+
+def _as_positive_vector(values: Sequence[float], name: str) -> np.ndarray:
+    """Return a validated one-dimensional positive float vector."""
+    vector = np.asarray(values, dtype=float)
+    if vector.ndim != 1 or vector.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional sequence.")
+    if np.any(vector <= 0):
+        raise ValueError(f"{name} must contain only positive values.")
+    return vector
+
+
+def _ensure_positive(value: float, name: str) -> None:
+    """Raise a clear error when a scalar parameter is not strictly positive."""
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
+
+
+def _validate_optional_component(flag: bool, component: object | None, name: str) -> None:
+    """Ensure optional geometry blocks are supplied when their flag is enabled."""
+    if flag and component is None:
+        raise ValueError(f"{name} geometry must be provided when {name.lower()}_exists is True.")
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +95,8 @@ class LauncherGeometry:
         Protuberance specification (required when protuberance_exists is True).
     """
 
-    stage_lengths: list[float]
-    stage_diameters: list[float]
+    stage_lengths: Sequence[float]
+    stage_diameters: Sequence[float]
     surface_roughness: float = 0.00025
     interference_factor: float = 1.04
     nose_joint_half_angle_deg: float = 20.0
@@ -88,20 +114,38 @@ class LauncherGeometry:
     # ------------------------------------------------------------------ #
 
     def __post_init__(self):
-        # Unit conversions (internal calculations use imperial, matching
-        # the empirical correlations from Stoney / Fleeman which were
-        # developed with imperial data)
-        M2FT = 3.28084
-        M2IN = 39.3701
+        stages = _as_positive_vector(self.stage_lengths, "stage_lengths")
+        diams = _as_positive_vector(self.stage_diameters, "stage_diameters")
 
-        stages = np.asarray(self.stage_lengths, dtype=float)
-        diams  = np.asarray(self.stage_diameters, dtype=float)
+        if stages.size != diams.size:
+            raise ValueError("stage_lengths and stage_diameters must have the same length.")
+        if stages.size < 2:
+            raise ValueError("At least a nose section and one body stage must be defined.")
+        if self.surface_roughness < 0:
+            raise ValueError("surface_roughness cannot be negative.")
+        _ensure_positive(self.interference_factor, "interference_factor")
+        _ensure_positive(self.ogive_factor, "ogive_factor")
+        if self.nose_joint_half_angle_deg < 0:
+            raise ValueError("nose_joint_half_angle_deg cannot be negative.")
+        if self.nose_bluntness_ratio < 0:
+            raise ValueError("nose_bluntness_ratio cannot be negative.")
 
-        self.L_total   = float(np.sum(stages))          # [m]
-        self.d_max     = float(np.max(diams))            # [m]
-        self.d_base    = float(diams[1])                 # aft diameter of 1st stage
-        self.L_nose    = float(stages[0])
-        self.d_nose    = float(diams[0])
+        _validate_optional_component(self.fin_exists, self.fins, "Fin")
+        _validate_optional_component(self.boattail_exists, self.boattail, "Boattail")
+        _validate_optional_component(
+            self.protuberance_exists,
+            self.protuberance,
+            "Protuberance",
+        )
+
+        self.stage_lengths = stages.tolist()
+        self.stage_diameters = diams.tolist()
+
+        self.L_total = float(np.sum(stages))
+        self.d_max = float(np.max(diams))
+        self.d_base = float(diams[1])
+        self.L_nose = float(stages[0])
+        self.d_nose = float(diams[0])
 
         # Effective length for wave-drag (conservative: use full length)
         self.L_effective = self.L_total
@@ -115,9 +159,9 @@ class LauncherGeometry:
             self.L_to_d_max = self.L_total - self.L_nose
 
         # Imperial equivalents
-        self.L_total_in  = self.L_total * M2IN
-        self.d_max_in    = self.d_max   * M2IN
-        self.L_nose_in   = self.L_nose  * M2IN
+        self.L_total_in = self.L_total * M_TO_IN
+        self.d_max_in = self.d_max * M_TO_IN
+        self.L_nose_in = self.L_nose * M_TO_IN
 
         # Wetted areas [m²]
         a_ogive = ((self.d_nose / 2) ** 2 + self.L_nose ** 2) / self.d_nose
@@ -126,11 +170,11 @@ class LauncherGeometry:
                     np.arcsin(self.L_nose / a_ogive) + self.L_nose))
         S_stages = [2 * np.pi * (diams[k] / 2) * stages[k]
                     for k in range(1, len(stages))]
-        self.S_wet_total    = S_nose + sum(S_stages)   # [m²]
-        self.S_wet_total_in = self.S_wet_total * M2IN ** 2  # [in²]
+        self.S_wet_total = S_nose + sum(S_stages)
+        self.S_wet_total_in = self.S_wet_total * M_TO_IN ** 2
 
         # Joint half-angle in radians
-        self.phi = self.nose_joint_half_angle_deg * np.pi / 180.0
+        self.phi = self.nose_joint_half_angle_deg * DEG_TO_RAD
 
         # Bluntness correction factor F_cr
         Br = self.nose_bluntness_ratio
@@ -149,26 +193,41 @@ class FinGeometry:
     sweep_LE_deg: float = 0.0  # leading-edge sweep angle  [deg]
 
     def __post_init__(self):
-        M2IN = 39.3701
+        if self.N_fins < 1:
+            raise ValueError("N_fins must be at least 1.")
+        _ensure_positive(self.root_chord, "root_chord")
+        _ensure_positive(self.tip_chord, "tip_chord")
+        _ensure_positive(self.span, "span")
+        _ensure_positive(self.max_thickness, "max_thickness")
+        if not 0 <= self.x_tc <= 1:
+            raise ValueError("x_tc must be between 0 and 1.")
+
         self.taper_ratio = self.tip_chord / self.root_chord
-        self.S_fin    = self.span * (self.root_chord + self.tip_chord) / 2   # [m²]
-        self.S_fin_in = self.S_fin * M2IN ** 2
-        self.root_chord_in = self.root_chord * M2IN
-        self.max_thickness_in = self.max_thickness * M2IN
+        self.S_fin = self.span * (self.root_chord + self.tip_chord) / 2
+        self.S_fin_in = self.S_fin * M_TO_IN ** 2
+        self.root_chord_in = self.root_chord * M_TO_IN
+        self.max_thickness_in = self.max_thickness * M_TO_IN
 
 
 @dataclass
 class BoattailGeometry:
     """Inter-stage boattail (frustum) geometry."""
     length: float          # axial length  [m]
-    diameter_fore: float   # forward (larger) diameter  [m]
-    diameter_aft: float    # aft (smaller) diameter  [m]
+    diameter_fore: float   # forward-station diameter  [m]
+    diameter_aft: float    # aft-station diameter  [m]
     ref_diameter: float    # reference diameter (= vehicle max diam)  [m]
 
     def __post_init__(self):
+        _ensure_positive(self.length, "length")
+        _ensure_positive(self.diameter_fore, "diameter_fore")
+        _ensure_positive(self.diameter_aft, "diameter_aft")
+        _ensure_positive(self.ref_diameter, "ref_diameter")
+        if np.isclose(self.diameter_fore, self.diameter_aft):
+            raise ValueError("diameter_fore and diameter_aft must differ for a boattail.")
+
         self.A_fore = np.pi * (self.diameter_fore / 2) ** 2
-        self.A_aft  = np.pi * (self.diameter_aft  / 2) ** 2
-        self.A_ref  = np.pi * (self.ref_diameter  / 2) ** 2
+        self.A_aft = np.pi * (self.diameter_aft / 2) ** 2
+        self.A_ref = np.pi * (self.ref_diameter / 2) ** 2
 
 
 @dataclass
@@ -179,10 +238,13 @@ class ProtuberanceGeometry:
     wetted_area: float       # total wetted area  [m²]
 
     def __post_init__(self):
-        M2IN = 39.3701
-        self.length_in          = self.length          * M2IN
-        self.max_cross_section_in = self.max_cross_section * M2IN ** 2
-        self.wetted_area_in     = self.wetted_area     * M2IN ** 2
+        _ensure_positive(self.length, "length")
+        _ensure_positive(self.max_cross_section, "max_cross_section")
+        _ensure_positive(self.wetted_area, "wetted_area")
+
+        self.length_in = self.length * M_TO_IN
+        self.max_cross_section_in = self.max_cross_section * M_TO_IN ** 2
+        self.wetted_area_in = self.wetted_area * M_TO_IN ** 2
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +267,7 @@ def _atmosphere(altitude_m: float):
     a_m : float  Speed of sound [m/s].
     nu_m : float Kinematic viscosity [m²/s].
     """
-    FT2M = 0.3048
-    alt_ft = altitude_m / FT2M
+    alt_ft = altitude_m / FT_TO_M
 
     # Speed of sound [ft/s]
     if alt_ft < 37_000:
@@ -225,7 +286,49 @@ def _atmosphere(altitude_m: float):
         a_coef, b_coef = 0.00002760, -0.03417
     nu_ft = 0.000157 * np.exp(a_coef * alt_ft + b_coef)
 
-    return a_ft * FT2M, nu_ft * FT2M ** 2
+    return a_ft * FT_TO_M, nu_ft * FT_TO_M ** 2
+
+
+def _compressibility_reynolds_factor(mach: float) -> float:
+    """Polynomial correction used in the Fleeman compressible Reynolds number."""
+    return (
+        1
+        + 0.0283 * mach
+        - 0.043 * mach ** 2
+        + 0.2107 * mach ** 3
+        - 0.03829 * mach ** 4
+        + 0.002709 * mach ** 5
+    )
+
+
+def _compressibility_skin_friction_factor(mach: float) -> float:
+    """Polynomial compressibility correction for turbulent skin friction."""
+    return (
+        1
+        + 0.00798 * mach
+        - 0.1813 * mach ** 2
+        + 0.0632 * mach ** 3
+        - 0.00933 * mach ** 4
+        + 0.000549 * mach ** 5
+    )
+
+
+def _incompressible_skin_friction(reynolds_number: float) -> float:
+    """Turbulent flat-plate skin-friction coefficient."""
+    return 0.037036 * reynolds_number ** (-0.155079)
+
+
+def _roughness_limited_skin_friction(
+    reference_length_in: float,
+    roughness_m: float,
+    mach: float,
+) -> float:
+    """Return the fully turbulent rough-wall skin-friction limit."""
+    if roughness_m <= 0:
+        return 0.0
+
+    cf_rough_inc = 1.0 / (1.89 + 1.62 * np.log10(reference_length_in / roughness_m)) ** 2.5
+    return cf_rough_inc / (1 + 0.2044 * mach ** 2)
 
 
 # ---------------------------------------------------------------------------
@@ -246,38 +349,27 @@ def skin_friction_drag(
     Cd_friction_body : ndarray  Body skin-friction CD vs. Mach.
     Cd_friction_total : ndarray Total (body + fins + protuberances) CD.
     """
-    mach  = np.asarray(mach_array, dtype=float)
+    mach = np.asarray(mach_array, dtype=float)
     a_m, nu_m = _atmosphere(altitude_m)
-    a_ft  = a_m  / 0.3048
-    nu_ft = nu_m / 0.3048 ** 2
+    a_ft = a_m / FT_TO_M
+    nu_ft = nu_m / FT_TO_M ** 2
 
-    Cd_body  = np.zeros_like(mach)
-    Cd_fin   = np.zeros_like(mach)
-    Cd_prot  = np.zeros_like(mach)
-    Cd_excr  = np.zeros_like(mach)
+    Cd_body = np.zeros_like(mach)
+    Cd_fin = np.zeros_like(mach)
+    Cd_prot = np.zeros_like(mach)
+    Cd_excr = np.zeros_like(mach)
 
-    L_in   = geom.L_total_in
-    d_in   = geom.d_max_in
-    S_in   = geom.S_wet_total_in
+    L_in = geom.L_total_in
+    d_in = geom.d_max_in
+    S_in = geom.S_wet_total_in
     K_skin = geom.surface_roughness
 
     for j, M in enumerate(mach):
-        # Compressible Reynolds number (Fleeman correction polynomial)
-        poly_Re = (1 + 0.0283*M - 0.043*M**2 + 0.2107*M**3
-                   - 0.03829*M**4 + 0.002709*M**5)
-        Re_c    = a_ft * M * (L_in / 12) / nu_ft * poly_Re
-
-        # Incompressible Cf (turbulent flat plate)
-        Cf_inc = 0.037036 * Re_c ** (-0.155079)
-
-        # Compressibility correction
-        poly_Cf = (1 + 0.00798*M - 0.1813*M**2 + 0.0632*M**3
-                   - 0.00933*M**4 + 0.000549*M**5)
-        Cf_comp = Cf_inc * poly_Cf
-
-        # Roughness-limited (fully turbulent rough wall)
-        Cf_rough_inc  = 1.0 / (1.89 + 1.62 * np.log10(L_in / K_skin)) ** 2.5
-        Cf_rough_comp = Cf_rough_inc / (1 + 0.2044 * M ** 2)
+        poly_Re = _compressibility_reynolds_factor(M)
+        poly_Cf = _compressibility_skin_friction_factor(M)
+        Re_c = a_ft * M * (L_in / 12) / nu_ft * poly_Re
+        Cf_comp = _incompressible_skin_friction(Re_c) * poly_Cf
+        Cf_rough_comp = _roughness_limited_skin_friction(L_in, K_skin, M)
 
         Cf = max(Cf_comp, Cf_rough_comp)
 
@@ -291,11 +383,8 @@ def skin_friction_drag(
             fins = geom.fins
             Cr_in = fins.root_chord_in
             Re_c_fin = a_ft * M * (Cr_in / 12) / nu_ft * poly_Re
-            Cf_inc_fin  = 0.037036 * Re_c_fin ** (-0.155079)
-            Cf_comp_fin = Cf_inc_fin * poly_Cf
-
-            Cf_rough_inc_fin  = 1.0 / (1.89 + 1.62 * np.log10(Cr_in / K_skin)) ** 2.5
-            Cf_rough_comp_fin = Cf_rough_inc_fin / (1 + 0.2044 * M ** 2)
+            Cf_comp_fin = _incompressible_skin_friction(Re_c_fin) * poly_Cf
+            Cf_rough_comp_fin = _roughness_limited_skin_friction(Cr_in, K_skin, M)
             Cf_fin_val = max(Cf_comp_fin, Cf_rough_comp_fin)
 
             Re_inc_fin = a_ft * M * (Cr_in / 12) / nu_ft
@@ -311,21 +400,28 @@ def skin_friction_drag(
                                + 0.5646 * lam ** 2 / log_Re_lam ** 3.6
                                - 1.0 / log_Re ** 3.6))
 
-            t_c   = fins.max_thickness_in / Cr_in
-            x_tc  = fins.x_tc
-            d_fin_in = geom.d_base * 39.3701  # diameter where fins attach
-            Cd_fin[j] = (Cf_fin_avg *
-                         (1 + 60 * t_c ** 4 + 0.8 * (1 + 5 * x_tc ** 2) * (fins.max_thickness / fins.root_chord)) *
-                         4 * fins.N_fins * fins.S_fin_in / (np.pi * d_fin_in ** 2))
+            t_c = fins.max_thickness_in / Cr_in
+            x_tc = fins.x_tc
+            d_fin_in = geom.d_base * M_TO_IN
+            Cd_fin[j] = (
+                Cf_fin_avg
+                * (
+                    1
+                    + 60 * t_c ** 4
+                    + 0.8 * (1 + 5 * x_tc ** 2) * (fins.max_thickness / fins.root_chord)
+                )
+                * 4
+                * fins.N_fins
+                * fins.S_fin_in
+                / (np.pi * d_fin_in ** 2)
+            )
 
         # --- Protuberances ---
         if geom.protuberance_exists and geom.protuberance is not None:
             p = geom.protuberance
             Re_c_p = a_ft * M * (p.length_in / 12) / nu_ft * poly_Re
-            Cf_inc_p  = 0.037036 * Re_c_p ** (-0.155079)
-            Cf_comp_p = Cf_inc_p * poly_Cf
-            Cf_rough_inc_p  = 1.0 / (1.89 + 1.62 * np.log10(p.length_in / K_skin)) ** 2.5
-            Cf_rough_comp_p = Cf_rough_inc_p / (1 + 0.2044 * M ** 2)
+            Cf_comp_p = _incompressible_skin_friction(Re_c_p) * poly_Cf
+            Cf_rough_comp_p = _roughness_limited_skin_friction(p.length_in, K_skin, M)
             Cf_p = max(Cf_comp_p, Cf_rough_comp_p)
 
             sqrt_A = np.sqrt(p.max_cross_section_in)
@@ -333,7 +429,7 @@ def skin_friction_drag(
                           (1 + 1.798 * (sqrt_A / p.length_in) ** 1.5) *
                           4 * p.wetted_area_in / (np.pi * d_in ** 2))
 
-        # --- Excrescencies (set to zero by default — can be re-enabled) ---
+        # --- Excrescencies (set to zero by default; can be re-enabled) ---
         if M < 0.78:
             K_e = 0.00038
         elif M > 1.04:
@@ -343,10 +439,12 @@ def skin_friction_drag(
                    - 2.1062 * M ** 2 + 1.2288 * M - 0.267171)
         Cd_excr[j] = 0.0 * K_e * 4 * S_in / (np.pi * d_in ** 2)  # disabled
 
-    Cd_total = (Cd_body
-                + geom.interference_factor * Cd_fin
-                + geom.interference_factor * Cd_prot
-                + Cd_excr)
+    Cd_total = (
+        Cd_body
+        + geom.interference_factor * Cd_fin
+        + geom.interference_factor * Cd_prot
+        + Cd_excr
+    )
     return Cd_body, Cd_total
 
 

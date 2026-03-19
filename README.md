@@ -4,11 +4,11 @@ A Python implementation of a **zero-lift and angle-of-attack drag coefficient
 estimation tool** for axisymmetric launch vehicles, covering subsonic,
 transonic, and supersonic flight regimes.
 
-The methodology is described in:
+Project context and the broader micro-launcher methodology are described in:
 
-> J. Rimani et al., *"Aerodynamic Drag Coefficient Prediction for Micro-Launchers"*,  
+> *"A trade-off methodology for micro-launchers"*,  
 > Aerospace Systems, Springer, 2021.  
-> https://doi.org/10.1007/s42401-021-00095-w
+> https://link.springer.com/article/10.1007/s42401-021-00095-w
 
 ---
 
@@ -43,8 +43,8 @@ from src.aerodynamics import LauncherGeometry, BoattailGeometry, compute_drag
 
 boattail = BoattailGeometry(
     length=0.6,
-    diameter_fore=1.0,
-    diameter_aft=1.3,
+    diameter_fore=1.0,  # forward station
+    diameter_aft=1.3,   # aft station
     ref_diameter=1.3,
 )
 
@@ -123,7 +123,3 @@ demonstrate the tool.  No real vehicle data is included or implied.
 
 ---
 
-## License
-
-See `LICENSE` file.  The physical models themselves are based on open
-literature references listed in the source code.

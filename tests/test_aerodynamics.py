@@ -3,15 +3,22 @@ Basic unit tests for the aerodynamics module.
 Run with:  pytest tests/test_aerodynamics.py -v
 """
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.aerodynamics import (
-    LauncherGeometry, BoattailGeometry, FinGeometry,
-    compute_drag, angle_of_attack_increment, _atmosphere,
+    BoattailGeometry,
+    LauncherGeometry,
+    angle_of_attack_increment,
+    compute_drag,
+    _atmosphere,
 )
 
 
@@ -48,6 +55,19 @@ def test_geometry_totals():
     assert abs(g.L_total - (1.8 + 7.0 + 3.5)) < 1e-9
     assert g.d_max == 1.3
     assert g.S_wet_total > 0
+
+
+def test_geometry_requires_matching_stage_vectors():
+    with pytest.raises(ValueError, match="same length"):
+        LauncherGeometry(
+            stage_lengths=[1.8, 7.0, 3.5],
+            stage_diameters=[1.2, 1.3],
+        )
+
+
+def test_geometry_requires_boattail_definition_when_enabled():
+    with pytest.raises(ValueError, match="Boattail geometry must be provided"):
+        simple_geom(boattail_exists=True, boattail=None)
 
 
 # ---- component drag sanity -------------------------------------------------
